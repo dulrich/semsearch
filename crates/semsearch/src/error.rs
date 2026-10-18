@@ -15,6 +15,12 @@ pub enum Error {
     /// Caller input rejected before reaching SQLite.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// A vector write in a space other than the one the index recorded.
+    #[error("embedding space mismatch: index has {recorded:?}, write uses {got:?}")]
+    SpaceMismatch {
+        recorded: crate::Space,
+        got: crate::Space,
+    },
 }
 
 /// Crate result alias.
