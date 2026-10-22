@@ -134,13 +134,7 @@ fn load(companion: &Path, index_path: &Path) -> Res<()> {
         let embedding = match (blob, blob_space.as_deref()) {
             (Some(b), Some(MODEL)) if b.len() == DIM * 4 => {
                 embedded += 1;
-                Some(
-                    b.as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|c| f32::from_le_bytes(*c))
-                        .collect(),
-                )
+                Some(le_f32s(&b))
             }
             _ => None,
         };
@@ -222,16 +216,19 @@ fn read_all_vectors(index_path: &Path) -> Res<Vec<(String, Vec<f32>)>> {
         conn.prepare("SELECT c.source, v.embedding FROM vectors v JOIN chunks c ON c.id = v.id")?;
     let rows = stmt.query_map([], |r| {
         let blob: Vec<u8> = r.get(1)?;
-        Ok((
-            r.get(0)?,
-            blob.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect(),
-        ))
+        Ok((r.get(0)?, le_f32s(&blob)))
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Decode little-endian f32s; a trailing partial chunk is ignored.
+fn le_f32s(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect()
 }
 
 fn unit(v: &[f32]) -> Vec<f32> {
@@ -320,12 +317,7 @@ fn query(
     }
     if let Some(qvecs_path) = qvecs_path {
         let bytes = std::fs::read(qvecs_path)?;
-        let floats: Vec<f32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect();
+        let floats: Vec<f32> = le_f32s(&bytes);
         let qvecs: Vec<Vec<f32>> = floats
             .as_chunks::<DIM>()
             .0
