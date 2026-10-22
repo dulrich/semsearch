@@ -27,7 +27,19 @@ const K: usize = 10;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+const USAGE: &str = "usage: bench load --companion <sqlite> --index <scratch.db>
+       bench query --index <scratch.db> --queries <file> [--qvecs <file>] [--reference <file>] [--pool N] [--rounds N] [--cleanup]
+       bench synthetic --index <scratch.db> --n <sources> [--rounds N] [--cleanup]
+       bench -h | --help
+
+Parity/latency harness; prints aggregate numbers only (see the module docs).
+";
+
 fn main() -> Res<()> {
+    if std::env::args().skip(1).any(|a| a == "--help" || a == "-h") {
+        print!("{USAGE}");
+        return Ok(());
+    }
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_default();
     let mut flags: HashMap<String, String> = HashMap::new();
