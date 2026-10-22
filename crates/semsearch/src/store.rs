@@ -8,7 +8,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::error::{Error, Result};
-use crate::vector::{Codes, Space, VECTOR_POOL, from_blob, normalized, sign_code, to_blob};
+use crate::vector::{
+    Admit, Space, VECTOR_POOL, Vectors, from_blob, normalized, sign_code, to_blob,
+};
 
 /// Schema version stored in `meta`. A mismatch rebuilds an empty index; never migrates.
 /// v2: embeddings moved from `chunks.embedding` to the `vectors` side table, so the rescore
@@ -111,13 +113,16 @@ pub struct SourceState {
 }
 
 /// One search index over one SQLite file.
+///
+/// The in-memory mirrors (rowid -> source map, sign codes) are a snapshot taken at open plus
+/// this handle's own writes. Another process's writes are invisible to the vector and coverage
+/// legs until the index is reopened (keyword bm25 runs in SQL and does see them).
 #[derive(Debug)]
 pub struct Index {
     pub(crate) conn: Connection,
     rebuilt: bool,
     read_only: bool,
-    space: Option<Space>,
-    pub(crate) codes: Codes,
+    pub(crate) vectors: Vectors,
     pub(crate) vector_pool: usize,
     /// Chunk rowid -> source, for rowid-only coverage scans (the companion's coverage map).
     pub(crate) chunk_source: HashMap<i64, Arc<str>>,
@@ -142,6 +147,10 @@ impl Index {
 
     /// Open an existing index read-only. Never creates, rebuilds or writes: a missing file is
     /// [`Error::NotFound`], a wrong or absent schema version is [`Error::SchemaMismatch`].
+    ///
+    /// The rowid -> source map and sign codes are a snapshot taken here; another process's
+    /// later writes are invisible to the vector and coverage legs until reopen (keyword bm25
+    /// SQL sees them).
     pub fn open_read_only(path: impl AsRef<Path>, opts: &IndexOptions) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
@@ -169,8 +178,7 @@ impl Index {
             conn,
             rebuilt: false,
             read_only,
-            space: None,
-            codes: Codes::default(),
+            vectors: Vectors::default(),
             vector_pool: opts.vector_pool,
             chunk_source: HashMap::new(),
         }
@@ -202,7 +210,7 @@ impl Index {
         self.chunk_source = map;
         let model = self.read_index_meta(META_EMBEDDING_MODEL)?;
         let dim = self.read_index_meta(META_EMBEDDING_DIM)?;
-        self.space = match (model, dim) {
+        let space = match (model, dim) {
             (Some(model), Some(dim)) => Some(Space {
                 model,
                 dim: dim.parse().map_err(|_| {
@@ -211,11 +219,11 @@ impl Index {
             }),
             _ => None,
         };
-        let Some(space) = &self.space else {
-            self.codes = Codes::default();
+        let Some(space) = space else {
+            self.vectors.reset();
             return Ok(());
         };
-        let mut codes = Codes::new(space.dim);
+        let mut vectors = Vectors::with_space(Some(space.clone()));
         let mut stmt = self
             .conn
             .prepare("SELECT id, embedding FROM vectors ORDER BY id")?;
@@ -231,11 +239,11 @@ impl Index {
                     space.dim * 4
                 )));
             }
-            codes.insert(rowid, &sign_code(&from_blob(blob)));
+            vectors.insert_loaded(rowid, &sign_code(&from_blob(blob)));
         }
         drop(rows);
         drop(stmt);
-        self.codes = codes;
+        self.vectors = vectors;
         Ok(())
     }
 
@@ -251,12 +259,12 @@ impl Index {
 
     /// The recorded embedding space, if any vector was ever written (and not reset).
     pub fn space(&self) -> Option<&Space> {
-        self.space.as_ref()
+        self.vectors.space()
     }
 
     /// Number of chunks in the in-memory sign-code table (= embedded chunks).
     pub fn embedded_count(&self) -> usize {
-        self.codes.len()
+        self.vectors.len()
     }
 
     /// Deliberate space change: drop every stored embedding and the recorded space. Keyword
@@ -269,26 +277,8 @@ impl Index {
             params![META_EMBEDDING_MODEL, META_EMBEDDING_DIM],
         )?;
         tx.commit()?;
-        self.space = None;
-        self.codes = Codes::default();
+        self.vectors.reset();
         Ok(())
-    }
-
-    /// Check `space` against the recorded one. `Ok(true)` = nothing recorded yet.
-    fn check_space(&self, space: &Space) -> Result<bool> {
-        if space.dim == 0 || space.model.is_empty() {
-            return Err(Error::InvalidInput(
-                "space needs a model and dim > 0".into(),
-            ));
-        }
-        match &self.space {
-            None => Ok(true),
-            Some(recorded) if recorded == space => Ok(false),
-            Some(recorded) => Err(Error::SpaceMismatch {
-                recorded: recorded.clone(),
-                got: space.clone(),
-            }),
-        }
     }
 
     fn record_space(tx: &rusqlite::Transaction<'_>, space: &Space) -> Result<()> {
@@ -375,8 +365,7 @@ impl Index {
             ],
         )?;
         tx.commit()?;
-        self.space = None;
-        self.codes = Codes::default();
+        self.vectors.reset();
         self.chunk_source.clear();
         Ok(())
     }
@@ -415,7 +404,7 @@ impl Index {
         let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(chunks.len());
         let mut first_space = false;
         if let Some(space) = space {
-            first_space = self.check_space(space)?;
+            first_space = self.vectors.admit(space)? == Admit::RecordSpace;
         }
         for chunk in chunks {
             vectors.push(match (&chunk.embedding, space) {
@@ -480,20 +469,13 @@ impl Index {
             _ => None,
         };
         tx.commit()?;
-        if let Some(space) = recorded {
-            self.codes = Codes::new(space.dim);
-            self.space = Some(space);
-        }
+        self.vectors.apply(recorded, &removed, added);
         for rowid in removed {
-            self.codes.remove(rowid);
             self.chunk_source.remove(&rowid);
         }
         let shared: Arc<str> = Arc::from(source);
         for rowid in rowids {
             self.chunk_source.insert(rowid, shared.clone());
-        }
-        for (rowid, code) in added {
-            self.codes.insert(rowid, &code);
         }
         Ok(())
     }
@@ -507,7 +489,7 @@ impl Index {
         source: &str,
         embeddings: &[(String, Vec<f32>)],
     ) -> Result<()> {
-        let first_space = self.check_space(space)?;
+        let first_space = self.vectors.admit(space)? == Admit::RecordSpace;
         let vectors: Vec<(&str, Vec<f32>)> = embeddings
             .iter()
             .map(|(id, v)| Ok((id.as_str(), normalized(v, space.dim)?)))
@@ -547,13 +529,8 @@ impl Index {
             Self::record_space(&tx, space)?;
         }
         tx.commit()?;
-        if record {
-            self.codes = Codes::new(space.dim);
-            self.space = Some(space.clone());
-        }
-        for (rowid, code) in added {
-            self.codes.insert(rowid, &code);
-        }
+        self.vectors
+            .apply(record.then(|| space.clone()), &[], added);
         Ok(())
     }
 
@@ -563,8 +540,8 @@ impl Index {
         let removed = delete_chunks(&tx, source)?;
         let n = tx.execute("DELETE FROM sources WHERE id = ?1", [source])?;
         tx.commit()?;
+        self.vectors.apply(None, &removed, Vec::new());
         for rowid in removed {
-            self.codes.remove(rowid);
             self.chunk_source.remove(&rowid);
         }
         Ok(n > 0)

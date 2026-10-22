@@ -322,7 +322,7 @@ impl Index {
     /// Hamming pre-scan + exact rescore: per-source (best score, best chunk rowid).
     fn vector_best(&self, query: &[f32], pool: usize) -> Result<HashMap<String, (f64, i64)>> {
         let mut best: HashMap<String, (f64, i64)> = HashMap::new();
-        let mut candidates = self.codes.nearest(&sign_code(query), pool);
+        let mut candidates = self.vectors.nearest(&sign_code(query), pool);
         candidates.sort_unstable();
         if candidates.is_empty() {
             return Ok(best);

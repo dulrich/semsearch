@@ -149,6 +149,94 @@ impl Codes {
     }
 }
 
+/// Outcome of [`Vectors::admit`]: whether a write in the checked space must record it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admit {
+    /// Nothing is recorded yet: the write must record its space.
+    RecordSpace,
+    /// The space is already recorded and equal.
+    Recorded,
+}
+
+/// The index's vector state, owned together: the recorded space and the sign codes.
+/// Invariant: codes are non-empty only under a recorded space, and the code word width is
+/// `space.dim.div_ceil(64)`.
+#[derive(Debug, Default)]
+pub(crate) struct Vectors {
+    space: Option<Space>,
+    codes: Codes,
+}
+
+impl Vectors {
+    /// Empty codes under `space` (as loaded at open); fill with [`Vectors::insert_loaded`].
+    pub fn with_space(space: Option<Space>) -> Self {
+        let codes = space
+            .as_ref()
+            .map_or_else(Codes::default, |s| Codes::new(s.dim));
+        Self { space, codes }
+    }
+
+    /// Add one code while loading. Requires a recorded space.
+    pub fn insert_loaded(&mut self, rowid: i64, code: &[u64]) {
+        debug_assert!(self.space.is_some());
+        self.codes.insert(rowid, code);
+    }
+
+    /// Forget the space and every code.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Validate `space` for a write against the recorded one.
+    pub fn admit(&self, space: &Space) -> Result<Admit> {
+        if space.dim == 0 || space.model.is_empty() {
+            return Err(Error::InvalidInput(
+                "space needs a model and dim > 0".into(),
+            ));
+        }
+        match &self.space {
+            None => Ok(Admit::RecordSpace),
+            Some(recorded) if recorded == space => Ok(Admit::Recorded),
+            Some(recorded) => Err(Error::SpaceMismatch {
+                recorded: recorded.clone(),
+                got: space.clone(),
+            }),
+        }
+    }
+
+    /// Apply a committed write: record `new_space` (fresh codes) if given, drop `removed`,
+    /// then insert `added`.
+    pub fn apply(
+        &mut self,
+        new_space: Option<Space>,
+        removed: &[i64],
+        added: Vec<(i64, Vec<u64>)>,
+    ) {
+        if let Some(space) = new_space {
+            self.codes = Codes::new(space.dim);
+            self.space = Some(space);
+        }
+        for &rowid in removed {
+            self.codes.remove(rowid);
+        }
+        for (rowid, code) in added {
+            self.codes.insert(rowid, &code);
+        }
+    }
+
+    pub fn space(&self) -> Option<&Space> {
+        self.space.as_ref()
+    }
+
+    pub fn len(&self) -> usize {
+        self.codes.len()
+    }
+
+    pub fn nearest(&self, query: &[u64], pool: usize) -> Vec<i64> {
+        self.codes.nearest(query, pool)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +263,23 @@ mod tests {
         assert_eq!(c.nearest(&sign_code(&[1.0, 1.0]), 1), vec![2]);
         c.insert(3, &sign_code(&[1.0, 1.0]));
         assert_eq!(c.nearest(&sign_code(&[1.0, 1.0]), 1), vec![3]);
+    }
+
+    #[test]
+    fn admit_first_same_mismatch() {
+        let a = Space::new("m", 2);
+        let mut v = Vectors::default();
+        assert_eq!(v.admit(&a).expect("ok"), Admit::RecordSpace);
+        assert!(v.admit(&Space::new("", 2)).is_err());
+        assert!(v.admit(&Space::new("m", 0)).is_err());
+        v.apply(Some(a.clone()), &[], vec![(1, sign_code(&[1.0, 1.0]))]);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v.admit(&a).expect("ok"), Admit::Recorded);
+        assert!(matches!(
+            v.admit(&Space::new("m", 3)),
+            Err(Error::SpaceMismatch { .. })
+        ));
+        v.reset();
+        assert!(v.space().is_none() && v.len() == 0);
     }
 }
