@@ -290,7 +290,7 @@ impl Index {
             };
             let blob = r.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?;
             if blob.len() != query.len() * 4 {
-                return Err(Error::InvalidInput(format!(
+                return Err(Error::Corrupt(format!(
                     "chunk {rowid} embedding has {} bytes",
                     blob.len()
                 )));

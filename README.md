@@ -1,6 +1,6 @@
 # semsearch
 
-Sync, in-process hybrid retrieval over one derived SQLite file: external-content FTS5 keyword search fused by reciprocal rank with a title-match leg and a document-level term-coverage leg (vector leg: WP-2).
+Sync, in-process hybrid retrieval over one derived SQLite file: external-content FTS5 keyword search fused by reciprocal rank with a title-match leg, a document-level term-coverage leg and a caller-supplied vector leg.
 
 ```rust
 use semsearch::{Chunk, Index, IndexOptions, Query};

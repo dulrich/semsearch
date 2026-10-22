@@ -213,9 +213,9 @@ impl Index {
         let space = match (model, dim) {
             (Some(model), Some(dim)) => Some(Space {
                 model,
-                dim: dim.parse().map_err(|_| {
-                    Error::InvalidInput(format!("corrupt embedding_dim meta {dim:?}"))
-                })?,
+                dim: dim
+                    .parse()
+                    .map_err(|_| Error::Corrupt(format!("corrupt embedding_dim meta {dim:?}")))?,
             }),
             _ => None,
         };
@@ -232,7 +232,7 @@ impl Index {
             let rowid: i64 = r.get(0)?;
             let blob = r.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?;
             if blob.len() != space.dim * 4 {
-                return Err(Error::InvalidInput(format!(
+                return Err(Error::Corrupt(format!(
                     "chunk {rowid} embedding has {} bytes, space dim {} needs {}",
                     blob.len(),
                     space.dim,

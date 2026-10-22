@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 /// Errors returned by [`crate::Index`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Underlying SQLite failure.
     #[error("sqlite: {0}")]
@@ -15,6 +16,10 @@ pub enum Error {
     /// Caller input rejected before reaching SQLite.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// Derived on-disk data is inconsistent (bad meta, wrong blob length). The index is
+    /// rebuildable: delete it and re-feed.
+    #[error("corrupt index: {0}")]
+    Corrupt(String),
     /// A vector write in a space other than the one the index recorded.
     #[error("embedding space mismatch: index has {recorded:?}, write uses {got:?}")]
     SpaceMismatch {

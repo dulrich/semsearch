@@ -1,5 +1,30 @@
 mod common;
 
+/// One 4-dim vector source, then `sql` run raw against the derived file; open must be Corrupt.
+fn assert_corrupt_after(sql: &str) {
+    let dir = TempDir::new();
+    let mut idx = open(&dir);
+    let c = chunk("c0", "A", "", "alpha").with_embedding(vec![1.0, 0.0, 0.0, 0.0]);
+    idx.upsert_source_in(&semsearch::Space::new("m", 4), "a.md", "h", &[c])
+        .unwrap();
+    drop(idx);
+    let conn = Connection::open(dir.db()).unwrap();
+    assert_eq!(conn.execute(sql, []).unwrap(), 1);
+    drop(conn);
+    let err = Index::open(dir.db(), &IndexOptions::default()).err();
+    assert!(matches!(err, Some(Error::Corrupt(_))), "{err:?}");
+}
+
+#[test]
+fn corrupt_embedding_dim_meta_is_corrupt() {
+    assert_corrupt_after("UPDATE meta SET value = 'four' WHERE key = 'embedding_dim'");
+}
+
+#[test]
+fn wrong_length_embedding_blob_is_corrupt() {
+    assert_corrupt_after("UPDATE vectors SET embedding = x'0000803f'");
+}
+
 use common::{TempDir, chunk, open, sources};
 use rusqlite::Connection;
 use semsearch::{Error, Index, IndexOptions, Query, SCHEMA_VERSION};
