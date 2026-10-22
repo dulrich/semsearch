@@ -3,11 +3,12 @@
 //! and term coverage, fused with RRF.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, params};
 
 use crate::error::{Error, Result};
-use crate::fusion::{Leg, RRF_K, fuse};
+use crate::fusion::{Leg, fuse};
 use crate::query::{FtsQuery, build_fts_query, make_text_snippet, title_match_score};
 use crate::store::Index;
 use crate::vector::{dot, from_blob, normalized, sign_code};
@@ -25,6 +26,10 @@ const TITLE_WEIGHT: f64 = 1.0;
 const COVERAGE_WEIGHT: f64 = 1.0;
 /// `RRF_VECTOR_WEIGHT` (ranking.mjs:18).
 const RRF_VECTOR_WEIGHT: f64 = 1.0;
+/// Fixed fusion-leg positions.
+const TITLE: usize = 0;
+const VECTOR: usize = 1;
+const COVERAGE: usize = 2;
 
 /// Phase 1: weighted bm25 (title 10, heading 5, text 1, entities 8), best chunk per source.
 /// `MATERIALIZED` keeps bm25() out of the aggregate context.
@@ -158,13 +163,23 @@ impl Index {
         let mut rows = self.pooled_search(&fts.primary, pool)?;
         let text_count = rows.len();
         let vector = match &query_vector {
-            Some(v) => {
-                let vpool = query.vector_pool.unwrap_or(self.vector_pool);
-                self.vector_leg(v, vpool, &mut rows)?
-            }
-            None => None,
+            Some(v) => self.vector_leg(v, query.vector_pool.unwrap_or(self.vector_pool))?,
+            None => Vec::new(),
         };
-        let coverage = self.coverage_leg(&fts, pool, &mut rows)?;
+        let coverage = self.coverage_leg(&fts, pool)?;
+
+        // Candidate assembly: text rows, then unseen vector sources, then unseen coverage
+        // sources, each in its leg's rank order; one hydration for all appended rows.
+        let wanted: Vec<(&str, i64)> = {
+            let mut known: HashSet<&str> = rows.iter().map(|r| r.source.as_str()).collect();
+            vector
+                .iter()
+                .chain(&coverage)
+                .filter(|s| known.insert(&s.source))
+                .map(|s| (&*s.source, s.rowid))
+                .collect()
+        };
+        rows.extend(self.hydrate_chunks(&wanted)?);
 
         let mut text_ranks: Vec<Option<usize>> = (1..=text_count).map(Some).collect();
         text_ranks.resize(rows.len(), None);
@@ -175,41 +190,27 @@ impl Index {
                 (s > 0.0).then_some(s)
             })
             .collect();
-        let mut legs = vec![Leg {
-            weight: TITLE_WEIGHT,
-            scores: title_scores,
-        }];
-        let title_slot = Some(0);
-        let mut vector_slot = None;
-        let mut coverage_slot = None;
-        if let Some(scores) = &vector {
-            vector_slot = Some(legs.len());
-            legs.push(Leg {
-                weight: RRF_VECTOR_WEIGHT,
-                scores: rows
-                    .iter()
-                    .map(|r| scores.get(&r.source).copied())
-                    .collect(),
-            });
-        }
-        if let Some(scores) = &coverage {
-            coverage_slot = Some(legs.len());
-            legs.push(Leg {
-                weight: COVERAGE_WEIGHT,
-                scores: rows
-                    .iter()
-                    .map(|r| scores.get(&r.source).copied())
-                    .collect(),
-            });
-        }
-        let fused = fuse(&text_ranks, &legs, RRF_K);
+        let leg_scores = |scored: &[Scored]| {
+            let by_source: HashMap<&str, f64> =
+                scored.iter().map(|s| (&*s.source, s.score)).collect();
+            rows.iter()
+                .map(|r| by_source.get(r.source.as_str()).copied())
+                .collect()
+        };
+        // Fixed positions: TITLE, VECTOR, COVERAGE.
+        let legs = [
+            (TITLE_WEIGHT, title_scores),
+            (RRF_VECTOR_WEIGHT, leg_scores(&vector)),
+            (COVERAGE_WEIGHT, leg_scores(&coverage)),
+        ]
+        .map(|(weight, scores)| Leg { weight, scores });
+        let fused = fuse(&text_ranks, &legs);
         let mut slots: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
         let mut hits = Vec::with_capacity(limit);
         for f in fused.into_iter().take(limit) {
             let Some(row) = slots.get_mut(f.index).and_then(Option::take) else {
                 continue;
             };
-            let rank = |slot: Option<usize>| slot.and_then(|s| f.leg_ranks[s]);
             hits.push(Hit {
                 source: row.source,
                 chunk_id: row.chunk_id,
@@ -224,9 +225,9 @@ impl Index {
                 metadata: row.metadata,
                 ranks: LegRanks {
                     text: text_ranks[f.index],
-                    title: rank(title_slot),
-                    vector: rank(vector_slot),
-                    coverage: rank(coverage_slot),
+                    title: f.leg_ranks[TITLE],
+                    vector: f.leg_ranks[VECTOR],
+                    coverage: f.leg_ranks[COVERAGE],
                 },
             });
         }
@@ -274,26 +275,42 @@ impl Index {
     }
 
     /// Vector leg: Hamming pre-scan over the sign codes, exact f32 rescore of the pool, best
-    /// chunk per source. Appends hydrated rows for sources not already in `rows`; returns
-    /// per-source cosine scores, or `None` when nothing scored.
-    fn vector_leg(
-        &self,
-        query: &[f32],
-        pool: usize,
-        rows: &mut Vec<Row>,
-    ) -> Result<Option<HashMap<String, f64>>> {
-        let best = self.vector_best(query, pool)?;
-        if best.is_empty() {
-            return Ok(None);
+    /// chunk per source, ranked (score desc, then source).
+    fn vector_leg(&self, query: &[f32], pool: usize) -> Result<Vec<Scored>> {
+        let mut candidates = self.vectors.nearest(&sign_code(query), pool);
+        candidates.sort_unstable();
+        let ids = json_ids(candidates.iter().copied());
+        let mut stmt = self.conn.prepare_cached(VECTOR_FETCH_SQL)?;
+        let mut q = stmt.query([ids])?;
+        let mut best = BestChunks::new();
+        while let Some(r) = q.next()? {
+            let rowid: i64 = r.get(0)?;
+            let Some(source) = self.chunk_source.get(&rowid) else {
+                continue;
+            };
+            let blob = r.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?;
+            if blob.len() != query.len() * 4 {
+                return Err(Error::InvalidInput(format!(
+                    "chunk {rowid} embedding has {} bytes",
+                    blob.len()
+                )));
+            }
+            offer_best(
+                &mut best,
+                source,
+                f64::from(dot(query, &from_blob(blob))),
+                rowid,
+            );
         }
-        let known: HashSet<String> = rows.iter().map(|r| r.source.clone()).collect();
-        // Deterministic append order: score desc, then source.
-        let mut extra: Vec<(&String, &(f64, i64))> =
-            best.iter().filter(|(s, _)| !known.contains(*s)).collect();
-        extra.sort_by(|a, b| b.1.0.total_cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
-        let wanted: Vec<(&str, i64)> = extra.iter().map(|(s, v)| (s.as_str(), v.1)).collect();
-        rows.extend(self.hydrate_chunks(&wanted)?);
-        Ok(Some(best.into_iter().map(|(s, (v, _))| (s, v)).collect()))
+        Ok(ranked(
+            best.into_iter()
+                .map(|(source, (score, rowid))| Scored {
+                    source,
+                    score,
+                    rowid,
+                })
+                .collect(),
+        ))
     }
 
     /// Pure vector retrieval (no text): the `k` nearest sources by best-chunk cosine, after
@@ -309,47 +326,12 @@ impl Index {
             return Ok(Vec::new());
         };
         let q = normalized(vector, space.dim)?;
-        let mut out: Vec<(String, f64)> = self
-            .vector_best(&q, pool)?
+        Ok(self
+            .vector_leg(&q, pool)?
             .into_iter()
-            .map(|(s, (v, _))| (s, v))
-            .collect();
-        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        out.truncate(k);
-        Ok(out)
-    }
-
-    /// Hamming pre-scan + exact rescore: per-source (best score, best chunk rowid).
-    fn vector_best(&self, query: &[f32], pool: usize) -> Result<HashMap<String, (f64, i64)>> {
-        let mut best: HashMap<String, (f64, i64)> = HashMap::new();
-        let mut candidates = self.vectors.nearest(&sign_code(query), pool);
-        candidates.sort_unstable();
-        if candidates.is_empty() {
-            return Ok(best);
-        }
-        let ids = json_ids(candidates.iter().copied());
-        let mut stmt = self.conn.prepare_cached(VECTOR_FETCH_SQL)?;
-        let mut q = stmt.query([ids])?;
-        while let Some(r) = q.next()? {
-            let rowid: i64 = r.get(0)?;
-            let Some(source) = self.chunk_source.get(&rowid) else {
-                continue;
-            };
-            let blob = r.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?;
-            if blob.len() != query.len() * 4 {
-                return Err(Error::InvalidInput(format!(
-                    "chunk {rowid} embedding has {} bytes",
-                    blob.len()
-                )));
-            }
-            let score = f64::from(dot(query, &from_blob(blob)));
-            let entry = best.entry(source.to_string()).or_insert((score, rowid));
-            if score > entry.0 || (score == entry.0 && rowid < entry.1) {
-                *entry = (score, rowid);
-            }
-        }
-        drop(q);
-        Ok(best)
+            .take(k)
+            .map(|s| (s.source.to_string(), s.score))
+            .collect())
     }
 
     /// Rows for chunks the FTS pool never returned, in input order: no bm25 score, snippet
@@ -390,22 +372,17 @@ impl Index {
         Ok(text.as_deref().map(make_text_snippet).unwrap_or_default())
     }
 
-    /// Document-level term coverage (`runCoverageLeg`, search.mjs:352). Appends hydrated rows
-    /// for sources the FTS pool missed; returns per-source coverage scores, or `None` when the
-    /// leg did not apply.
-    fn coverage_leg(
-        &self,
-        fts: &FtsQuery,
-        pool: usize,
-        rows: &mut Vec<Row>,
-    ) -> Result<Option<HashMap<String, f64>>> {
+    /// Document-level term coverage (`runCoverageLeg`, search.mjs:352): sources covering at
+    /// least [`COVERAGE_MIN_TERMS`] terms, ranked (score desc, then source), truncated to
+    /// `pool`, each with its best-covering chunk. Empty when the leg does not apply.
+    fn coverage_leg(&self, fts: &FtsQuery, pool: usize) -> Result<Vec<Scored>> {
         let n_terms = fts.terms.len();
-        if n_terms < COVERAGE_MIN_TERMS || fts.expanded.len() != n_terms {
-            return Ok(None);
+        if n_terms < COVERAGE_MIN_TERMS {
+            return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare_cached(COVERAGE_SQL)?;
-        let mut source_terms: HashMap<String, usize> = HashMap::new();
-        let mut chunk_terms: HashMap<i64, (usize, String)> = HashMap::new();
+        let mut source_terms: HashMap<Arc<str>, usize> = HashMap::new();
+        let mut chunk_terms: HashMap<i64, (usize, Arc<str>)> = HashMap::new();
         for expression in &fts.expanded {
             let mut seen_sources = HashSet::new();
             let mut seen_chunks = HashSet::new();
@@ -415,46 +392,65 @@ impl Index {
                 let Some(source) = self.chunk_source.get(&rowid) else {
                     continue;
                 };
-                let source = source.to_string();
                 if seen_chunks.insert(rowid) {
                     chunk_terms
                         .entry(rowid)
-                        .or_insert_with(|| (0, source.clone()))
+                        .or_insert_with(|| (0, Arc::clone(source)))
                         .0 += 1;
                 }
-                if seen_sources.insert(source.clone()) {
-                    *source_terms.entry(source).or_insert(0) += 1;
+                if seen_sources.insert(Arc::clone(source)) {
+                    *source_terms.entry(Arc::clone(source)).or_insert(0) += 1;
                 }
             }
         }
-        let mut ranked: Vec<(String, f64)> = source_terms
-            .into_iter()
-            .filter(|(_, count)| *count >= COVERAGE_MIN_TERMS)
-            .map(|(s, count)| (s, count as f64 / n_terms as f64))
-            .collect();
-        if ranked.is_empty() {
-            return Ok(None);
-        }
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        ranked.truncate(pool);
-
-        // Best-covering chunk per source (ties: lowest rowid, for determinism).
-        let mut best: HashMap<&str, (usize, i64)> = HashMap::new();
+        let mut best = BestChunks::new();
         for (rowid, (count, source)) in &chunk_terms {
-            let entry = best.entry(source.as_str()).or_insert((*count, *rowid));
-            if *count > entry.0 || (*count == entry.0 && *rowid < entry.1) {
-                *entry = (*count, *rowid);
-            }
+            offer_best(&mut best, source, *count as f64, *rowid);
         }
-        let known: HashSet<String> = rows.iter().map(|r| r.source.clone()).collect();
-        let wanted: Vec<(&str, i64)> = ranked
-            .iter()
-            .filter(|(source, _)| !known.contains(source))
-            .filter_map(|(source, _)| best.get(source.as_str()).map(|b| (source.as_str(), b.1)))
-            .collect();
-        rows.extend(self.hydrate_chunks(&wanted)?);
-        Ok(Some(ranked.into_iter().collect()))
+        let mut out = ranked(
+            source_terms
+                .into_iter()
+                .filter(|(_, count)| *count >= COVERAGE_MIN_TERMS)
+                .filter_map(|(source, count)| {
+                    let rowid = best.get(&source)?.1;
+                    Some(Scored {
+                        source,
+                        score: count as f64 / n_terms as f64,
+                        rowid,
+                    })
+                })
+                .collect(),
+        );
+        out.truncate(pool);
+        Ok(out)
     }
+}
+
+/// One source's result on a leg: its score and best chunk.
+struct Scored {
+    source: Arc<str>,
+    score: f64,
+    rowid: i64,
+}
+
+type BestChunks = HashMap<Arc<str>, (f64, i64)>;
+
+/// Best chunk per source: highest score, ties by lower rowid.
+fn offer_best(best: &mut BestChunks, source: &Arc<str>, score: f64, rowid: i64) {
+    let entry = best.entry(Arc::clone(source)).or_insert((score, rowid));
+    if score > entry.0 || (score == entry.0 && rowid < entry.1) {
+        *entry = (score, rowid);
+    }
+}
+
+/// Leg rank order: score desc, then source asc.
+fn ranked(mut scored: Vec<Scored>) -> Vec<Scored> {
+    scored.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.source.cmp(&b.source))
+    });
+    scored
 }
 
 /// A JSON array of rowids, for `json_each` binding.

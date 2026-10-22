@@ -3,7 +3,7 @@
 //! Candidates are indexed `0..n`. The text (bm25) leg is given as a rank per candidate; every
 //! other leg is a weight plus an optional score per candidate (higher is better). A leg ranks
 //! its scored candidates by score descending, ties broken by text rank (absent text rank sorts
-//! last), then by candidate index. WP-2 adds the vector leg by passing one more [`Leg`].
+//! last), then by candidate index. An empty leg contributes nothing.
 
 /// RRF constant (`RRF_K`, ranking.mjs:16).
 pub(crate) const RRF_K: f64 = 60.0;
@@ -26,13 +26,13 @@ pub(crate) struct Fused {
 
 /// Fuse. `text_ranks[i]` is candidate `i`'s 1-based bm25 rank (weight 1.0) or `None`.
 /// Returns every candidate, sorted by fused score descending.
-pub(crate) fn fuse(text_ranks: &[Option<usize>], legs: &[Leg], k: f64) -> Vec<Fused> {
+pub(crate) fn fuse(text_ranks: &[Option<usize>], legs: &[Leg]) -> Vec<Fused> {
     let n = text_ranks.len();
     let text_order = |i: usize| text_ranks[i].unwrap_or(usize::MAX);
     let mut out: Vec<Fused> = (0..n)
         .map(|i| Fused {
             index: i,
-            rrf: text_ranks[i].map_or(0.0, |r| 1.0 / (k + r as f64)),
+            rrf: text_ranks[i].map_or(0.0, |r| 1.0 / (RRF_K + r as f64)),
             leg_ranks: vec![None; legs.len()],
         })
         .collect();
@@ -48,7 +48,7 @@ pub(crate) fn fuse(text_ranks: &[Option<usize>], legs: &[Leg], k: f64) -> Vec<Fu
         for (rank0, (i, _)) in scored.into_iter().enumerate() {
             let rank = rank0 + 1;
             out[i].leg_ranks[leg_no] = Some(rank);
-            out[i].rrf += leg.weight / (k + rank as f64);
+            out[i].rrf += leg.weight / (RRF_K + rank as f64);
         }
     }
     out.sort_by(|a, b| {
@@ -78,7 +78,7 @@ mod tests {
                 scores: vec![Some(0.5), Some(1.0), None],
             },
         ];
-        let fused = fuse(&text, &legs, RRF_K);
+        let fused = fuse(&text, &legs);
         let order: Vec<usize> = fused.iter().map(|f| f.index).collect();
         assert_eq!(order, vec![1, 0, 2]);
         // Candidate 1: text 2, leg0 rank 1 (tie broken by text rank), leg1 rank 1.
@@ -91,12 +91,12 @@ mod tests {
         assert_eq!(fused[2].leg_ranks, vec![Some(2), None]);
         assert!((fused[2].rrf - 1.0 / 62.0).abs() < 1e-12);
         // Same input, same output.
-        assert_eq!(fuse(&text, &legs, RRF_K), fused);
+        assert_eq!(fuse(&text, &legs), fused);
     }
 
     #[test]
     fn no_legs_preserves_text_order() {
-        let fused = fuse(&[Some(2), Some(1), None], &[], RRF_K);
+        let fused = fuse(&[Some(2), Some(1), None], &[]);
         let order: Vec<usize> = fused.iter().map(|f| f.index).collect();
         assert_eq!(order, vec![1, 0, 2]);
     }
