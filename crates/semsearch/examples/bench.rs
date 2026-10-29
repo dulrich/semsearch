@@ -40,6 +40,13 @@ fn main() -> Res<()> {
         print!("{USAGE}");
         return Ok(());
     }
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--build" || a == "--version")
+    {
+        println!("{}", env!("FLEET_BUILD_ID"));
+        return Ok(());
+    }
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_default();
     let mut flags: HashMap<String, String> = HashMap::new();
