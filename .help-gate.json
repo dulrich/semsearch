@@ -1,5 +1,4 @@
 {
-  "build-flags": "enforce",
   "entrypoints": [
     { "path": "crates/semsearch/examples/bench.rs", "invoke": ["./target/debug/examples/bench"], "build": "cargo build --offline --example bench" }
   ],
