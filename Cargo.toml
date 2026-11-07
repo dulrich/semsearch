@@ -6,6 +6,8 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 publish = false
+authors = ["David Ulrich <david@ulrichdev.com>"]
+repository = "https://github.com/dulrich/semsearch"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

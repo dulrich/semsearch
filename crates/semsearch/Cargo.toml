@@ -1,10 +1,12 @@
 [package]
 name = "semsearch"
-version = "0.2.0"
+version = "0.2.1"
 description = "Sync hybrid retrieval over one derived SQLite/FTS5 file"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 rusqlite = { version = "=0.40.2", features = ["bundled"] }

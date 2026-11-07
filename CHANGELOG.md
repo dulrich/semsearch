@@ -1,6 +1,23 @@
 # Changelog
 
-All notable changes to `semsearch`. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning policy in `AGENTS.md`.
+All notable changes to `semsearch`. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning policy in the README's "Versioning" section.
+
+## [0.2.1] - 2026-11-07
+
+### Added
+
+- `LICENSE` file (MIT).
+- `authors` and `repository` package metadata.
+- Public README.
+
+### Changed
+
+- The versioning policy now tags each release (`vX.Y.Z`).
+- The bench example answers `--build` and `--version`.
+- Rust toolchain pinned to 1.99.1.
+- Tests write temporary databases on tmpfs.
+
+The library API and index schema are unchanged.
 
 ## [0.2.0] - 2026-10-22
 
