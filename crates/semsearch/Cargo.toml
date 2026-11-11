@@ -1,6 +1,6 @@
 [package]
 name = "semsearch"
-version = "0.2.1"
+version = "0.3.0"
 description = "Sync hybrid retrieval over one derived SQLite/FTS5 file"
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
 thiserror = "=2.0.21"
 
 [lints]

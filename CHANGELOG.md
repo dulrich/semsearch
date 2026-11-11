@@ -2,6 +2,12 @@
 
 All notable changes to `semsearch`. Release rule: the `publish` skill's `## Releases` section; local specifics in `AGENTS.md` "Versioning".
 
+## 0.3.0 — 2026-11-10
+
+### Changed
+
+- **Breaking:** `rusqlite` is now pinned `=0.41.1` (bundled SQLite 3.54.1 via `libsqlite3-sys` 0.39.1), fixing RUSTSEC-2026-0459 / CVE-2026-119375. `semsearch::Error::Sqlite` wraps `rusqlite::Error`, and `libsqlite3-sys` allows one version per build graph, so consumers must move to `rusqlite` 0.41 together.
+
 ## 0.2.1 — 2026-11-07
 
 ### Added
