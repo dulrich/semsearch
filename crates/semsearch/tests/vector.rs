@@ -242,6 +242,31 @@ fn vector_leg_finds_nearest_neighbour() {
 }
 
 #[test]
+fn reopen_loads_sign_codes_with_identical_vector_hits() {
+    let dir = TempDir::new();
+    let mut index = open(&dir);
+    let docs = corpus(&mut index, 50, 9);
+    let queries: Vec<Vec<f32>> = [3, 17, 41].iter().map(|&i| docs[i].1.clone()).collect();
+    let run = |index: &Index| -> Vec<Vec<(String, Option<usize>)>> {
+        queries
+            .iter()
+            .map(|q| {
+                index
+                    .search(&Query::new("common").with_limit(20).with_vector(q.clone()))
+                    .expect("search")
+                    .into_iter()
+                    .map(|h| (h.source, h.ranks.vector))
+                    .collect()
+            })
+            .collect()
+    };
+    let before = run(&index);
+    drop(index);
+    let index = open(&dir);
+    assert_eq!(run(&index), before);
+}
+
+#[test]
 fn full_pool_recall_equals_exact_and_small_pool_caps_leg() {
     let dir = TempDir::new();
     let mut index = open(&dir);

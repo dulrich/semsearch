@@ -58,6 +58,19 @@ pub(crate) fn from_blob(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// [`sign_code`] of [`from_blob`]`(b)`, written into `out` (resized to `b.len() / 4` dims), without
+/// materialising the `f32` vector. Same predicate (`> 0.0`) and bit order.
+pub(crate) fn sign_code_from_blob(b: &[u8], out: &mut Vec<u64>) {
+    let chunks = b.as_chunks::<4>().0;
+    out.clear();
+    out.resize(chunks.len().div_ceil(64), 0);
+    for (i, c) in chunks.iter().enumerate() {
+        if f32::from_le_bytes(*c) > 0.0 {
+            out[i / 64] |= 1 << (i % 64);
+        }
+    }
+}
+
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -249,6 +262,43 @@ mod tests {
         assert_eq!(to_blob(&[1.0])[..], 1.0f32.to_le_bytes());
         assert!(normalized(&[0.0, 0.0], 2).is_err());
         assert!(normalized(&[1.0], 2).is_err());
+    }
+
+    #[test]
+    fn sign_code_from_blob_matches_sign_code() {
+        let edges = [
+            0.0f32,
+            -0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let mut buf = Vec::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for dim in [1usize, 8, 63, 64, 65, 130, 384] {
+            let v: Vec<f32> = (0..dim)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    if i % 5 == 0 {
+                        edges[(seed % 8) as usize]
+                    } else {
+                        (seed as i32 as f32) / i32::MAX as f32
+                    }
+                })
+                .collect();
+            let blob = to_blob(&v);
+            sign_code_from_blob(&blob, &mut buf);
+            assert_eq!(buf, sign_code(&from_blob(&blob)), "dim {dim}");
+        }
+        let blob = to_blob(&edges);
+        sign_code_from_blob(&blob, &mut buf);
+        assert_eq!(buf, sign_code(&from_blob(&blob)));
+        assert_eq!(buf, vec![0b0100_0100]);
     }
 
     #[test]

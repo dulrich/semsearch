@@ -2,6 +2,12 @@
 
 All notable changes to `semsearch`. Release rule: the `publish` skill's `## Releases` section; local specifics in `AGENTS.md` "Versioning".
 
+## 0.3.1 — 2026-11-11
+
+### Changed
+
+- Index open computes sign codes straight from the stored blobs, without a per-vector `Vec<f32>` or `Vec<u64>`: allocation while opening a 95,019-vector index drops from 427.9 MiB to 45.2 MiB. No API, schema or result change.
+
 ## 0.3.0 — 2026-11-10
 
 ### Changed

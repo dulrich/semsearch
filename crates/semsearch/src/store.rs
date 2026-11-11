@@ -9,7 +9,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::vector::{
-    Admit, Space, VECTOR_POOL, Vectors, from_blob, normalized, sign_code, to_blob,
+    Admit, Space, VECTOR_POOL, Vectors, normalized, sign_code, sign_code_from_blob, to_blob,
 };
 
 /// Schema version stored in `meta`. A mismatch rebuilds an empty index; never migrates.
@@ -224,6 +224,7 @@ impl Index {
             return Ok(());
         };
         let mut vectors = Vectors::with_space(Some(space.clone()));
+        let mut code = Vec::new();
         let mut stmt = self
             .conn
             .prepare("SELECT id, embedding FROM vectors ORDER BY id")?;
@@ -239,7 +240,8 @@ impl Index {
                     space.dim * 4
                 )));
             }
-            vectors.insert_loaded(rowid, &sign_code(&from_blob(blob)));
+            sign_code_from_blob(blob, &mut code);
+            vectors.insert_loaded(rowid, &code);
         }
         drop(rows);
         drop(stmt);
